@@ -1,11 +1,12 @@
 #!/bin/bash
 
 
-conda create -n feature_splatting python=3.7.13
-conda activate feature_splatting
+# conda create -n feature_splatting python=3.7.13
+# conda activate feature_splatting
+source activate gaussians
 
 # seems that we sometimes got stuck in environment.yml, so we install the packages one by one
-conda install pytorch==1.12.1 torchvision==0.13.1 torchaudio==0.12.1 cudatoolkit=11.6 -c pytorch -c conda-forge
+# conda install pytorch==1.12.1 torchvision==0.13.1 torchaudio==0.12.1 cudatoolkit=11.6 -c pytorch -c conda-forge
 
 
 # Install for Gaussian Rasterization (Ch9) - Ours-Full
@@ -33,19 +34,21 @@ pip install -e thirdparty/mmcv -v # take ~30min; if mmcv dir is empty: `git subm
 pip install natsort
 pip install scipy
 pip install kornia
-# install colmap for preprocess, work with python3.8
-conda create -n colmapenv python=3.8
-conda activate colmapenv
-pip install opencv-python-headless
-pip install tqdm
-pip install natsort
-pip install Pillow
-# just some files need torch be installed.
-conda install pytorch==1.12.1 -c pytorch -c conda-forge
-conda config --set channel_priority false
-conda install colmap -c conda-forge
 
-conda activate feature_splatting
+
+# # install colmap for preprocess, work with python3.8
+# conda create -n colmapenv python=3.8
+# source activate colmapenv
+# pip install opencv-python-headless
+# pip install tqdm
+# pip install natsort
+# pip install Pillow
+# # just some files need torch be installed.
+# conda install pytorch==1.12.1 -c pytorch -c conda-forge
+# conda config --set channel_priority false
+# conda install colmap -c conda-forge
+
+# source activate feature_splatting
 
 
 

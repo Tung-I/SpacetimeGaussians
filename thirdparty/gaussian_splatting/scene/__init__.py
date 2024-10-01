@@ -20,6 +20,7 @@ from PIL import Image
 from utils.camera_utils import camera_to_JSON, cameraList_from_camInfosv2, cameraList_from_camInfosv2nogt
 from helper_train import recordpointshelper, getfisheyemapper
 import torch 
+
 class Scene:
 
     # gaussians : GaussianModel
@@ -33,7 +34,6 @@ class Scene:
         self.gaussians = gaussians
         self.refmodelpath = None
     
-
         if load_iteration:
             if load_iteration == -1:
                 self.loaded_iter = searchForMaxIteration(os.path.join(self.model_path, "point_cloud"))
@@ -44,7 +44,6 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
         raydict = {}
-
 
         if loader == "colmap" or loader == "colmapvalid": # colmapvalid only for testing
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, multiview, duration=duration)
@@ -80,9 +79,6 @@ class Scene:
             random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
             random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
 
- 
-
-
         self.cameras_extent = scene_info.nerf_normalization["radius"]
 
         for resolution_scale in resolution_scales:
@@ -97,9 +93,7 @@ class Scene:
 
             else: # immersive and immersivevalid 
                 self.train_cameras[resolution_scale] = cameraList_from_camInfosv2(scene_info.train_cameras, resolution_scale, args)
-            
-            
-            
+             
             print("Loading Test Cameras")
             if loader  in ["colmapvalid", "immersivevalid", "colmap", "technicolorvalid", "technicolor", "imv2","imv2valid"]: # we need gt for metrics
                 self.test_cameras[resolution_scale] = cameraList_from_camInfosv2(scene_info.test_cameras, resolution_scale, args)

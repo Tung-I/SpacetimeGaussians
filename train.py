@@ -25,19 +25,13 @@ import torch
 from random import randint
 import random 
 import sys 
-import uuid
-import time 
-import json
-
 import torchvision
 import numpy as np 
 import torch.nn.functional as F
 import cv2
 from tqdm import tqdm
 
-
 sys.path.append("./thirdparty/gaussian_splatting")
-
 from thirdparty.gaussian_splatting.utils.loss_utils import l1_loss, ssim, l2_loss, rel_loss
 from helper_train import getrenderpip, getmodel, getloss, controlgaussians, reloadhelper, trbfunction, setgtisint8, getgtisint8
 from thirdparty.gaussian_splatting.scene import Scene
@@ -46,79 +40,86 @@ from thirdparty.gaussian_splatting.helper3dg import getparser, getrenderparts
 
 
 def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration=50, rgbfunction="rgbv1", rdpip="v2"):
+    """
+    Args:
+        dataset: Dataset object, contains data and configurations for training.
+        opt: Options object, stores hyperparameters and training settings.
+        pipe: Pipeline object, used for rendering or image processing.
+        saving_iterations: List of iterations when the model will be saved.
+        debug_from: int, iteration from which debugging starts.
+        densify: int, determines if densification is used (0: No, 1: Yes, 2: Yes with prune).
+        duration: int, total duration of training in terms of iterations.
+        rgbfunction: str, specifies the RGB function to be used for rendering.
+        rdpip: str, specifies the rendering pipeline version to be used.
+    """
+    print(opt)
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
 
     first_iter = 0
     render, GRsetting, GRzer = getrenderpip(rdpip)
 
+    # Set various Gaussian model parameters
     print("use model {}".format(dataset.model))
     GaussianModel = getmodel(dataset.model) # gmodel, gmodelrgbonly
-    
     gaussians = GaussianModel(dataset.sh_degree, rgbfunction)
     gaussians.trbfslinit = -1*opt.trbfslinit # 
     gaussians.preprocesspoints = opt.preprocesspoints 
     gaussians.addsphpointsscale = opt.addsphpointsscale 
     gaussians.raystart = opt.raystart
 
-
-
-
-
     rbfbasefunction = trbfunction
     scene = Scene(dataset, gaussians, duration=duration, loader=dataset.loader)
     
-
     currentxyz = gaussians._xyz 
     maxx, maxy, maxz = torch.amax(currentxyz[:,0]), torch.amax(currentxyz[:,1]), torch.amax(currentxyz[:,2])# z wrong...
     minx, miny, minz = torch.amin(currentxyz[:,0]), torch.amin(currentxyz[:,1]), torch.amin(currentxyz[:,2])
-     
-
+    
+    # Load model from previous checkpoint if available
     if os.path.exists(opt.prevpath):
         print("load from " + opt.prevpath)
         reloadhelper(gaussians, opt, maxx, maxy, maxz,  minx, miny, minz)
    
-
-
     maxbounds = [maxx, maxy, maxz]
     minbounds = [minx, miny, minz]
-
 
     gaussians.training_setup(opt)
     
     numchannel = 9 
-
     bg_color = [1, 1, 1] if dataset.white_background else [0 for i in range(numchannel)]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
+    # Initialize CUDA events for timing
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
+    # Initialize placeholders and other variables for training
     viewpoint_stack = None
     ema_loss_for_log = 0.0
-    #if freeze != 1:
     first_iter = 0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
 
+    # Initialize flags and dictionaries for tracking training progress
     flag = 0
     flagtwo = 0
     depthdict = {}
 
+    # Prepare training camera list and dict for multi-batch training
     if opt.batch > 1:
         traincameralist = scene.getTrainCameras().copy()
         traincamdict = {}
         for i in range(duration): # 0 to 4, -> (0.0, to 0.8)
             traincamdict[i] = [cam for cam in traincameralist if cam.timestamp == i/duration]
     
-    
+    # Initialize timestep tensor if not set
     if gaussians.ts is None :
         H,W = traincameralist[0].image_height, traincameralist[0].image_width
         gaussians.ts = torch.ones(1,1,H,W).cuda()
 
     scene.recordpoints(0, "start training")
 
-                                                            
+    # Initialize flags and counters for tracking early stopping and EMS (Error Minimization Sampling)                                                          
     flagems = 0  
     emscnt = 0
     lossdiect = {}
@@ -127,69 +128,69 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
     validdepthdict = {}
     emsstartfromiterations = opt.emsstart   
 
+    # Precompute depth statistics for each camera view before starting training
     with torch.no_grad():
         timeindex = 0 # 0 to 49
         viewpointset = traincamdict[timeindex]
         for viewpoint_cam in viewpointset:
             render_pkg = render(viewpoint_cam, gaussians, pipe, background,  override_color=None,  basicfunction=rbfbasefunction, GRsetting=GRsetting, GRzer=GRzer)
-            
             _, depthH, depthW = render_pkg["depth"].shape
             borderH = int(depthH/2)
             borderW = int(depthW/2)
-
             midh =  int(viewpoint_cam.image_height/2)
             midw =  int(viewpoint_cam.image_width/2)
-            
             depth = render_pkg["depth"]
             slectemask = depth != 15.0 
-
             validdepthdict[viewpoint_cam.image_name] = torch.median(depth[slectemask]).item()   
             depthdict[viewpoint_cam.image_name] = torch.amax(depth[slectemask]).item() 
-    
+
+    # Prune points if densification is enabled
     if densify == 1 or  densify == 2: 
         zmask = gaussians._xyz[:,2] < 4.5  
         gaussians.prune_points(zmask) 
         torch.cuda.empty_cache()
 
 
-    selectedlength = 2
-    lasterems = 0 
-    gtisint8 = getgtisint8()
+    selectedlength = 2  # Number of views selected for EMS
+    lasterems = 0 # Last EMS iteration
+    gtisint8 = getgtisint8() # Check if ground truth image is in int8 format
 
     for iteration in range(first_iter, opt.iterations + 1):        
-        if iteration ==  opt.emsstart:
+        if iteration ==  opt.emsstart:  # Start EMS at specified iteration
             flagems = 1 # start ems
 
-        iter_start.record()
+        iter_start.record() # Start timing the iteration
         gaussians.update_learning_rate(iteration)
         
-        if (iteration - 1) == debug_from:
+        if (iteration - 1) == debug_from:  # Enable debugging mode at a specific iteration
             pipe.debug = True
+
         if gaussians.rgbdecoder is not None:
             gaussians.rgbdecoder.train()
 
-        if opt.batch > 1:
+        if opt.batch > 1:  
             gaussians.zero_gradient_cache()
             timeindex = randint(0, duration-1) # 0 to 49
-            viewpointset = traincamdict[timeindex]
-            camindex = random.sample(viewpointset, opt.batch)
+            viewpointset = traincamdict[timeindex]  # Randomly pick a time index
+            camindex = random.sample(viewpointset, opt.batch)  # Randomly sample batch of cameras
 
             for i in range(opt.batch):
                 viewpoint_cam = camindex[i]
                 render_pkg = render(viewpoint_cam, gaussians, pipe, background,  override_color=None,  basicfunction=rbfbasefunction, GRsetting=GRsetting, GRzer=GRzer)
                 image, viewspace_point_tensor, visibility_filter, radii = getrenderparts(render_pkg) 
                 
+                # Get ground truth image (normalize if in int8 format)
                 if gtisint8:
                     gt_image = viewpoint_cam.original_image.cuda().float()/255.0
                 else:
-                    # cast float on cuda will introduce gradient, so cast first then to cuda. at the cost of i/o
                     gt_image = viewpoint_cam.original_image.float().cuda()  
-                if opt.gtmask: # for training with undistorted immerisve image, masking black pixels in undistorted image. 
+
+                if opt.gtmask:  # Apply mask to avoid black pixels in undistorted immersive images
                     mask = torch.sum(gt_image, dim=0) == 0
                     mask = mask.float()
                     image = image * (1- mask) +  gt_image * (mask)
 
-
+                # Calculate loss based on the regularization method
                 if opt.reg == 2:
                     Ll1 = l2_loss(image, gt_image)
                     loss = Ll1
@@ -200,6 +201,7 @@ def train(dataset, opt, pipe, saving_iterations, debug_from, densify=0, duration
                     Ll1 = l1_loss(image, gt_image)
                     loss = getloss(opt, Ll1, ssim, image, gt_image, gaussians, radii)
 
+                # Update loss directory for EMS
                 if flagems == 1:
                     if viewpoint_cam.image_name not in lossdiect:
                         lossdiect[viewpoint_cam.image_name] = loss.item()

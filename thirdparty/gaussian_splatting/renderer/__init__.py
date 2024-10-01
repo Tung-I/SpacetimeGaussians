@@ -31,6 +31,182 @@ from utils.sh_utils import eval_sh
 from utils.graphics_utils import getProjectionMatrixCV, focal2fov, fov2focal
 
 
+def test_ours_lite(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, basicfunction = None,GRsetting=None, GRzer=None):
+    """
+    Args:
+        viewpoint_camera: Camera object, the current viewpoint for rendering.
+        pc: GaussianModel, the point cloud model containing 3D points and associated features.
+        pipe: Rendering pipeline object, used for the rendering process.
+        bg_color: torch.Tensor, background color for rendering (should be on GPU).
+        scaling_modifier: float, factor to modify the scale of the points.
+        override_color: Optional, overrides the color of the points if provided.
+        basicfunction: Optional, function applied to the points (e.g., radial basis function).
+        GRsetting: Callable, settings for the rasterizer.
+        GRzer: Callable, rasterizer object for rendering.
+
+    Returns:
+        dict: Contains the rendered image, viewspace points, visibility filter, point radii, and duration of the rendering process.
+    """
+    # Create an empty tensor for the screen-space coordinates of the points
+    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
+
+    # Synchronize CUDA to ensure timings are accurate and record start time
+    torch.cuda.synchronize()
+    startime = time.time()
+
+    # Calculate field of view tangents for x and y directions based on the camera parameters
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+
+    # Configure the rasterizer settings
+    raster_settings = GRsetting(
+        image_height=int(viewpoint_camera.image_height),
+        image_width=int(viewpoint_camera.image_width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=bg_color,
+        scale_modifier=scaling_modifier,
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
+        sh_degree=pc.active_sh_degree,
+        campos=viewpoint_camera.camera_center,
+        prefiltered=False,
+        debug=False)
+
+    rasterizer = GRzer(raster_settings=raster_settings)
+    
+    # Calculate time-offset for temporal radial basis functions and retrieve precomputed point features
+    tforpoly = viewpoint_camera.timestamp - pc.get_trbfcenter
+    rotations = pc.get_rotation(tforpoly) # to try use 
+    colors_precomp = pc.get_features(tforpoly)
+
+    # Prepare screen-space point means (means2D) and precomputed covariance for 3D points (optional)
+    means2D = screenspace_points
+    cov3D_precomp = None
+    shs = None
+ 
+    rendered_image, radii = rasterizer(
+        timestamp = viewpoint_camera.timestamp, 
+        trbfcenter = pc.get_trbfcenter,
+        trbfscale = pc.computedtrbfscale ,
+        motion = pc._motion,
+        means3D = pc.get_xyz,
+        means2D = means2D,
+        shs = shs,
+        colors_precomp = colors_precomp,
+        opacities = pc.computedopacity,
+        scales = pc.computedscales,
+        rotations = rotations,
+        cov3D_precomp = cov3D_precomp)
+    
+    torch.cuda.synchronize()
+    duration = time.time() - startime 
+    return {"render": rendered_image,
+            "viewspace_points": screenspace_points,
+            "visibility_filter" : radii > 0,
+            "radii": radii,
+            "duration":duration}
+
+def train_ours_lite(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, basicfunction = None, GRsetting=None, GRzer=None):
+    """
+    Args:
+        viewpoint_camera: Camera object, specifies the viewpoint for rendering.
+        pc: GaussianModel, contains 3D point cloud data and associated features (e.g., opacity, color, etc.).
+        pipe: Rendering pipeline object, used for the rendering process.
+        bg_color: torch.Tensor, background color for rendering (should be on GPU).
+        scaling_modifier: float, modifies the scale of the points during rendering.
+        override_color: Optional, allows overriding the color of the points.
+        basicfunction: Optional, radial basis function or other transformation applied to the points.
+        GRsetting: Callable, settings for the rasterizer.
+        GRzer: Callable, rasterizer object for rendering.
+    Returns:
+        dict: Contains the rendered image, viewspace points, visibility filter, radii, opacity, and depth data.
+    """
+
+     # Create a zero-initialized tensor for the screen-space coordinates of the points (gradients will be computed)
+    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
+     # Initialize a tensor for point times (used for temporal processing) and try to retain gradients
+    pointtimes = torch.ones((pc.get_xyz.shape[0],1), dtype=pc.get_xyz.dtype, requires_grad=False, device="cuda") + 0  
+    try:
+        screenspace_points.retain_grad()
+    except:
+        pass
+
+    # Compute field of view tangents for x and y directions based on camera settings
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+
+    raster_settings = GRsetting(
+        image_height=int(viewpoint_camera.image_height),
+        image_width=int(viewpoint_camera.image_width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=bg_color,
+        scale_modifier=scaling_modifier,
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
+        sh_degree=pc.active_sh_degree,
+        campos=viewpoint_camera.camera_center,
+        prefiltered=False)
+
+    rasterizer = GRzer(raster_settings=raster_settings)
+
+    
+    means3D = pc.get_xyz
+    means2D = screenspace_points
+    pointopacity = pc.get_opacity
+
+    # Compute the temporal radial basis function (TRBF) output for opacity modification
+    trbfcenter = pc.get_trbfcenter
+    trbfscale = pc.get_trbfscale
+    trbfdistanceoffset = viewpoint_camera.timestamp * pointtimes - trbfcenter
+    trbfdistance =  trbfdistanceoffset / torch.exp(trbfscale) 
+    trbfoutput = basicfunction(trbfdistance)
+    opacity = pointopacity * trbfoutput  # - 0.5
+    pc.trbfoutput = trbfoutput
+
+    cov3D_precomp = None
+    scales = pc.get_scaling
+    shs = None
+
+    # Compute point motion and update 3D positions based on the motion model and time
+    tforpoly = trbfdistanceoffset.detach()
+    means3D = means3D +  pc._motion[:, 0:3] * tforpoly + pc._motion[:, 3:6] * tforpoly * tforpoly + pc._motion[:, 6:9] * tforpoly *tforpoly * tforpoly
+
+    rotations = pc.get_rotation(tforpoly) # to try use 
+    colors_precomp = pc.get_features(tforpoly)
+
+    rendered_image, radii, depth = rasterizer(
+        means3D = means3D,
+        means2D = means2D,
+        shs = shs,
+        colors_precomp = colors_precomp,
+        opacities = opacity,
+        scales = scales,
+        rotations = rotations,
+        cov3D_precomp = cov3D_precomp)
+
+    # # Compared with test
+    # rendered_image, radii = rasterizer(
+    #     timestamp = viewpoint_camera.timestamp, 
+    #     trbfcenter = pc.get_trbfcenter,
+    #     trbfscale = pc.computedtrbfscale ,
+    #     motion = pc._motion,
+    #     means3D = pc.get_xyz,
+    #     means2D = means2D,
+    #     shs = shs,
+    #     colors_precomp = colors_precomp,
+    #     opacities = pc.computedopacity,
+    #     scales = pc.computedscales,
+    #     rotations = rotations,
+    #     cov3D_precomp = cov3D_precomp)
+
+    return {"render": rendered_image,
+            "viewspace_points": screenspace_points,
+            "visibility_filter" : radii > 0,
+            "radii": radii,
+            "opacity": opacity,
+            "depth": depth}
 
 
 def train_ours_full(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, basicfunction = None, GRsetting=None, GRzer=None):
@@ -78,7 +254,6 @@ def train_ours_full(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch
     trbfdistanceoffset = viewpoint_camera.timestamp * pointtimes - trbfcenter
     trbfdistance =  trbfdistanceoffset / torch.exp(trbfscale) 
     trbfoutput = basicfunction(trbfdistance)
-    
     opacity = pointopacity * trbfoutput  # - 0.5
     pc.trbfoutput = trbfoutput
 
@@ -283,154 +458,6 @@ def test_ours_full_fused(viewpoint_camera, pc : GaussianModel, pipe, bg_color : 
             "radii": radii,
             "rawrendered_image": rendered_image,
              "duration": duration}
-
-
-
-def test_ours_lite(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, basicfunction = None,GRsetting=None, GRzer=None):
-
-    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
-
-    torch.cuda.synchronize()
-    startime = time.time()
-
-    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
-    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
-
-    raster_settings = GRsetting(
-        image_height=int(viewpoint_camera.image_height),
-        image_width=int(viewpoint_camera.image_width),
-        tanfovx=tanfovx,
-        tanfovy=tanfovy,
-        bg=bg_color,
-        scale_modifier=scaling_modifier,
-        viewmatrix=viewpoint_camera.world_view_transform,
-        projmatrix=viewpoint_camera.full_proj_transform,
-        sh_degree=pc.active_sh_degree,
-        campos=viewpoint_camera.camera_center,
-        prefiltered=False,
-        debug=False)
-
-    rasterizer = GRzer(raster_settings=raster_settings)
-    
-    
-
-
-    tforpoly = viewpoint_camera.timestamp - pc.get_trbfcenter
-    rotations = pc.get_rotation(tforpoly) # to try use 
-    colors_precomp = pc.get_features(tforpoly)
-
-    
-    means2D = screenspace_points
-   
-
-    cov3D_precomp = None
-
-
-    shs = None
- 
-    rendered_image, radii = rasterizer(
-        timestamp = viewpoint_camera.timestamp, 
-        trbfcenter = pc.get_trbfcenter,
-        trbfscale = pc.computedtrbfscale ,
-        motion = pc._motion,
-        means3D = pc.get_xyz,
-        means2D = means2D,
-        shs = shs,
-        colors_precomp = colors_precomp,
-        opacities = pc.computedopacity,
-        scales = pc.computedscales,
-        rotations = rotations,
-        cov3D_precomp = cov3D_precomp)
-    
-    
-    torch.cuda.synchronize()
-    duration = time.time() - startime 
-    return {"render": rendered_image,
-            "viewspace_points": screenspace_points,
-            "visibility_filter" : radii > 0,
-            "radii": radii,
-            "duration":duration}
-
-
-
-
-def train_ours_lite(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, basicfunction = None, GRsetting=None, GRzer=None):
-    """
-    Render the scene. 
-    
-    Background tensor (bg_color) must be on GPU!
-    """
- 
-    # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
-    pointtimes = torch.ones((pc.get_xyz.shape[0],1), dtype=pc.get_xyz.dtype, requires_grad=False, device="cuda") + 0 # 
-    try:
-        screenspace_points.retain_grad()
-    except:
-        pass
-
-    # Set up rasterization configuration
-    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
-    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
-
-    raster_settings = GRsetting(
-        image_height=int(viewpoint_camera.image_height),
-        image_width=int(viewpoint_camera.image_width),
-        tanfovx=tanfovx,
-        tanfovy=tanfovy,
-        bg=bg_color,
-        scale_modifier=scaling_modifier,
-        viewmatrix=viewpoint_camera.world_view_transform,
-        projmatrix=viewpoint_camera.full_proj_transform,
-        sh_degree=pc.active_sh_degree,
-        campos=viewpoint_camera.camera_center,
-        prefiltered=False)
-
-    rasterizer = GRzer(raster_settings=raster_settings)
-
-    
-    means3D = pc.get_xyz
-    means2D = screenspace_points
-    pointopacity = pc.get_opacity
-
-    trbfcenter = pc.get_trbfcenter
-    trbfscale = pc.get_trbfscale
-   
-
-    trbfdistanceoffset = viewpoint_camera.timestamp * pointtimes - trbfcenter
-    trbfdistance =  trbfdistanceoffset / torch.exp(trbfscale) 
-    trbfoutput = basicfunction(trbfdistance)
-    
-    opacity = pointopacity * trbfoutput  # - 0.5
-    pc.trbfoutput = trbfoutput
-
-    cov3D_precomp = None
-
-    scales = pc.get_scaling
-
-    shs = None
-    tforpoly = trbfdistanceoffset.detach()
-    means3D = means3D +  pc._motion[:, 0:3] * tforpoly + pc._motion[:, 3:6] * tforpoly * tforpoly + pc._motion[:, 6:9] * tforpoly *tforpoly * tforpoly
-
-    rotations = pc.get_rotation(tforpoly) # to try use 
-    colors_precomp = pc.get_features(tforpoly)
-
-    rendered_image, radii, depth = rasterizer(
-        means3D = means3D,
-        means2D = means2D,
-        shs = shs,
-        colors_precomp = colors_precomp,
-        opacities = opacity,
-        scales = scales,
-        rotations = rotations,
-        cov3D_precomp = cov3D_precomp)
-
-    return {"render": rendered_image,
-            "viewspace_points": screenspace_points,
-            "visibility_filter" : radii > 0,
-            "radii": radii,
-            "opacity": opacity,
-            "depth": depth}
 
 
 def train_ours_fullss(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, basicfunction = None, GRsetting=None, GRzer=None):

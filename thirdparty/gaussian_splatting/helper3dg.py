@@ -40,7 +40,6 @@ def getparser():
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 10000, 12000, 25_000, 30_000])
     parser.add_argument("--test_iterations", default=-1, type=int)
-
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
@@ -50,16 +49,12 @@ def getparser():
     parser.add_argument("--rgbfunction", type=str, default = "rgbv1")
     parser.add_argument("--rdpip", type=str, default = "v2")
     parser.add_argument("--configpath", type=str, default = "None")
-
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
-    
     print("Optimizing " + args.model_path)
     
     # Initialize system state (RNG)
     safe_state(args.quiet)
-
-
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
 
     # incase we provide config file not directly pass to the file
@@ -80,7 +75,6 @@ def getparser():
     if not os.path.exists(args.model_path):
         os.makedirs(args.model_path)
     
-
     return args, lp.extract(args), op.extract(args), pp.extract(args)
 
 def getrenderparts(render_pkg):
